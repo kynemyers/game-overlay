@@ -443,7 +443,8 @@ class OverlayWindow:
         """Recreate labels from current config (toggles, colours, font)."""
         cfg = self.cfg
         bg = cfg["bg_color"] if cfg["show_background"] else TRANSPARENT_COLOR
-        self.frame.config(bg=bg, padx=10, pady=6)
+        size = int(cfg["font_size"])
+        self.frame.config(bg=bg, padx=max(6, int(size * 0.7)), pady=max(4, int(size * 0.4)))
         for lbl in self.labels.values():
             lbl.destroy()
         self.labels = {}
@@ -549,9 +550,11 @@ class SettingsWindow:
 
         ttk.Label(af, text="Size").grid(row=1, column=0, sticky="w")
         self.size_var = tk.IntVar(value=cfg["font_size"])
-        ttk.Spinbox(af, from_=8, to=48, textvariable=self.size_var, width=6,
-                    command=lambda: self._set("font_size", self.size_var.get())
-                    ).grid(row=1, column=1, sticky="w", padx=8, pady=2)
+        sp = ttk.Spinbox(af, from_=6, to=72, textvariable=self.size_var, width=6,
+                         command=self._set_size)
+        sp.grid(row=1, column=1, sticky="w", padx=8, pady=2)
+        sp.bind("<Return>", lambda e: self._set_size())
+        sp.bind("<FocusOut>", lambda e: self._set_size())
 
         ttk.Label(af, text="Opacity").grid(row=2, column=0, sticky="w")
         self.opacity_var = tk.IntVar(value=cfg["opacity"])
@@ -630,6 +633,13 @@ class SettingsWindow:
     def _set(self, key, value):
         self.cfg[key] = value
         self._apply()
+
+    def _set_size(self):
+        try:
+            size = max(6, min(72, int(self.size_var.get())))
+        except tk.TclError:
+            return  # ignore non-numeric input while typing
+        self._set("font_size", size)
 
     def _apply(self):
         save_config(self.cfg)
