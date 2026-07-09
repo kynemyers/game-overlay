@@ -168,6 +168,7 @@ class PingWorker(threading.Thread):
         self.last_detect = 0.0
         self._cand_lock = threading.Lock()
         self._detecting = False
+        self._empty_scans = 0
 
     def run(self):
         while RUNNING.is_set():
@@ -213,6 +214,8 @@ class PingWorker(threading.Thread):
             return cands[self.cand_idx % len(cands)], "auto"
         return manual, "fallback"
 
+    STALE_AFTER_SCANS = 2  # ~2 quiet detection cycles (~20s) -> drop last known server
+
     def _detect_bg(self):
         """Detection samples live traffic for ~2s, so it runs off-thread."""
         try:
@@ -220,11 +223,23 @@ class PingWorker(threading.Thread):
             pid = STATS.game_pid
             game_alive = bool(pid and psutil and psutil.pid_exists(pid))
             with self._cand_lock:
-                if found and found != self.candidates:
-                    self.candidates = found
-                    self.cand_idx = 0
+                if found:
+                    self._empty_scans = 0
+                    if found != self.candidates:
+                        self.candidates = found
+                        self.cand_idx = 0
                 elif not game_alive:
                     self.candidates = []  # game closed - stop pinging its server
+                    self._empty_scans = 0
+                elif self.candidates:
+                    # Game is alive but sent no traffic this scan (menu/lobby
+                    # lull) - keep the last known server for a couple of
+                    # scans, but don't ping a stale/disconnected address
+                    # forever; fall back once the quiet spell persists.
+                    self._empty_scans += 1
+                    if self._empty_scans >= self.STALE_AFTER_SCANS:
+                        self.candidates = []
+                        self._empty_scans = 0
         finally:
             self._detecting = False
 
