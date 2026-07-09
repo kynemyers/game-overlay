@@ -656,21 +656,14 @@ class OverlayWindow:
         for m, lbl in self.labels.items():
             label = self.cfg["metrics"][m]["label"]
             lbl.config(text="%-*s %s" % (lbl._label_pad + 1, label, format_value(m, stats)))
-        self._reposition()
         if self.visible:
-            self._reassert_topmost()  # some games steal topmost
-
-    def _reassert_topmost(self):
-        # Re-asserting via tk's `-topmost` attribute snaps the window back to
-        # its last-committed geometry on this Tk build, undoing _reposition.
-        # SetWindowPos with SWP_NOMOVE/SWP_NOSIZE re-pins z-order only.
-        HWND_TOPMOST = -1
-        SWP_NOMOVE = 0x0002
-        SWP_NOSIZE = 0x0001
-        SWP_NOACTIVATE = 0x0010
-        hwnd = user32.GetParent(self.win.winfo_id()) or self.win.winfo_id()
-        user32.SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0,
-                            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE)
+            # Reassert topmost (some games steal it) BEFORE repositioning:
+            # tk's -topmost attribute snaps the window back to its last-
+            # committed geometry as a side effect, so geometry must be set
+            # afterwards to win. Doing it in the opposite order is what
+            # caused the overlay to appear stuck at its initial position.
+            self.win.attributes("-topmost", True)
+        self._reposition()
 
     def _reposition(self):
         self.win.update_idletasks()
@@ -698,7 +691,8 @@ class OverlayWindow:
         self.visible = visible
         if visible:
             self.win.deiconify()
-            self._reassert_topmost()
+            self.win.attributes("-topmost", True)
+            self._reposition()
         else:
             self.win.withdraw()
 
