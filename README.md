@@ -40,11 +40,17 @@ Like most external overlays, it **cannot draw over exclusive-fullscreen games**.
 Set your game's display mode to **Borderless / Windowed Fullscreen** (looks identical,
 and is the default in most modern games). FPS capture works in any mode.
 
-### Ping host
+### Ping
 
-By default it pings `1.1.1.1` (Cloudflare). For a ping that matches your in-game ping,
-enter your game server's IP in **Settings → Network**. Packet loss is measured over the
-last ~50 pings.
+In **Auto** mode (the default) the overlay finds the server your game is actually
+connected to — it reads the game process's network connections and pings that address,
+so the ping changes when you switch servers/regions. If a server ignores pings (some
+block ICMP), the overlay automatically tries the game's other remote addresses.
+
+You can switch to a fixed **Custom host** in Settings → Network. When no game is
+detected, auto mode falls back to the custom host (default `1.1.1.1`). Packet loss is
+measured over the last ~50 pings. The status bar in the settings window shows exactly
+which address is being pinged.
 
 ## Running from source
 

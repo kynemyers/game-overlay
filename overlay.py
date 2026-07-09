@@ -10,14 +10,16 @@ LibreHardwareMonitor via a small bundled helper (bin/HardwareMonitor.exe).
 
 import atexit
 import ctypes
+import ipaddress
 import json
 import os
 import re
+import socket
 import subprocess
 import sys
 import threading
 import time
-from collections import deque
+from collections import Counter, deque
 from ctypes import wintypes
 
 import tkinter as tk
@@ -58,6 +60,7 @@ DEFAULT_CONFIG = {
     "opacity": 92,
     "show_background": True,
     "bg_color": "#101014",
+    "ping_mode": "auto",
     "ping_host": "1.1.1.1",
     "metrics": {
         "fps":      {"enabled": True, "label": "FPS",  "color": "#00ff88"},
@@ -125,6 +128,7 @@ class Stats:
         self.ping_status = "starting"
         self.hw_status = "starting"
         self.fps_status = "starting"
+        self.game_pid = None  # pid of the game the FPS worker is attached to
 
     def set(self, **kwargs):
         with self._lock:
@@ -142,25 +146,92 @@ RUNNING.set()
 # ----------------------------------------------------------- ping worker ---
 
 class PingWorker(threading.Thread):
-    """Pings the configured host once a second; tracks latency and loss."""
+    """Measures latency and packet loss, once a second.
+
+    In "auto" mode it looks up the remote addresses the game process is
+    actually connected to (UDP first - that's where game traffic lives)
+    and pings the game server itself. Servers that never answer ICMP get
+    rotated out for the game's next remote address. Falls back to the
+    configured custom host when no game connection is found.
+    """
+
+    DETECT_EVERY = 10  # rescan the game's connections every N seconds
 
     def __init__(self, cfg):
         super().__init__(daemon=True)
         self.cfg = cfg
         self.history = deque(maxlen=50)  # (success, ms) over last ~50s
+        self.cur_host = None
+        self.candidates = []
+        self.cand_idx = 0
+        self.last_detect = 0.0
 
     def run(self):
         while RUNNING.is_set():
             start = time.time()
-            host = self.cfg.get("ping_host", "1.1.1.1").strip() or "1.1.1.1"
+            host, source = self._choose_host()
+            if host != self.cur_host:
+                self.cur_host = host
+                self.history.clear()
             success, ms = self._ping_once(host)
             self.history.append((success, ms))
-            fails = sum(1 for ok, _ in self.history if not ok)
-            loss = 100.0 * fails / len(self.history)
-            last_ok = next((m for ok, m in reversed(self.history) if ok), None)
+            if any(ok for ok, _ in self.history):
+                fails = sum(1 for ok, _ in self.history if not ok)
+                loss = 100.0 * fails / len(self.history)
+                last_ok = next((m for ok, m in reversed(self.history) if ok), None)
+                STATS.ping_status = "%s (%s)" % (host, source)
+            else:
+                loss = None
+                last_ok = None
+                STATS.ping_status = "%s (%s) not answering" % (host, source)
+                if source == "auto" and len(self.history) >= 5:
+                    # server ignores ICMP - try the game's next remote address
+                    self.cand_idx += 1
+                    self.history.clear()
             STATS.set(ping=last_ok, loss=loss)
-            STATS.ping_status = "ok" if success else "no reply from %s" % host
             time.sleep(max(0.0, 1.0 - (time.time() - start)))
+
+    def _choose_host(self):
+        manual = (self.cfg.get("ping_host") or "1.1.1.1").strip() or "1.1.1.1"
+        if self.cfg.get("ping_mode", "auto") != "auto":
+            return manual, "custom"
+        now = time.time()
+        if now - self.last_detect >= self.DETECT_EVERY:
+            self.last_detect = now
+            found = self._detect_game_server()
+            if found != self.candidates:
+                self.candidates = found
+                self.cand_idx = 0
+        if self.candidates:
+            return self.candidates[self.cand_idx % len(self.candidates)], "auto"
+        return manual, "fallback"
+
+    @staticmethod
+    def _detect_game_server():
+        """Public IPv4 addresses the game process talks to, most-used first."""
+        pid = STATS.game_pid
+        if not pid or not psutil or not psutil.pid_exists(pid):
+            return []
+        try:
+            proc = psutil.Process(pid)
+            get_conns = getattr(proc, "net_connections", None) or proc.connections
+            conns = get_conns(kind="inet")
+        except psutil.Error:
+            return []
+        udp, tcp = [], []
+        for c in conns:
+            if not c.raddr:
+                continue
+            try:
+                ip = ipaddress.ip_address(c.raddr.ip)
+            except ValueError:
+                continue
+            if ip.version != 4 or not ip.is_global:
+                continue
+            (udp if c.type == socket.SOCK_DGRAM else tcp).append(c.raddr.ip)
+        ordered = [ip for ip, _ in Counter(udp).most_common()]
+        ordered += [ip for ip, _ in Counter(tcp).most_common() if ip not in ordered]
+        return ordered
 
     @staticmethod
     def _ping_once(host):
@@ -276,6 +347,11 @@ IGNORED_PROCS = {
     "explorer.exe", "searchhost.exe", "startmenuexperiencehost.exe",
     "textinputhost.exe", "shellexperiencehost.exe", "applicationframehost.exe",
     "taskmgr.exe", "lockapp.exe", "dwm.exe", "systemsettings.exe",
+    # browsers/launchers: alt-tabbing to these shouldn't steal the game target
+    "chrome.exe", "msedge.exe", "firefox.exe", "opera.exe", "opera_gx.exe",
+    "brave.exe", "vivaldi.exe", "discord.exe", "steam.exe", "steamwebhelper.exe",
+    "epicgameslauncher.exe", "battle.net.exe", "claude.exe", "spotify.exe",
+    "slack.exe",
 }
 
 
@@ -340,6 +416,7 @@ class FpsWorker(threading.Thread):
             return  # already attached
         self._stop_proc()
         self.target_pid, self.target_name = pid, name
+        STATS.game_pid = pid
         with self._frames_lock:
             self.frames.clear()
         try:
@@ -589,14 +666,23 @@ class SettingsWindow:
         # --- network ---
         nf = ttk.LabelFrame(main, text=" Network ", padding=8)
         nf.pack(fill="x", pady=(10, 0))
-        ttk.Label(nf, text="Ping host").grid(row=0, column=0, sticky="w")
+        self.pingmode_var = tk.StringVar(value=cfg.get("ping_mode", "auto"))
+        ttk.Radiobutton(nf, text="Auto-detect game server (recommended)", value="auto",
+                        variable=self.pingmode_var,
+                        command=lambda: self._set("ping_mode", "auto")
+                        ).grid(row=0, column=0, columnspan=2, sticky="w")
+        ttk.Radiobutton(nf, text="Custom host:", value="manual",
+                        variable=self.pingmode_var,
+                        command=lambda: self._set("ping_mode", "manual")
+                        ).grid(row=1, column=0, sticky="w")
         self.host_var = tk.StringVar(value=cfg["ping_host"])
         he = ttk.Entry(nf, textvariable=self.host_var, width=18)
-        he.grid(row=0, column=1, sticky="w", padx=8)
+        he.grid(row=1, column=1, sticky="w", padx=8)
         he.bind("<Return>", lambda e: self._set("ping_host", self.host_var.get().strip()))
         he.bind("<FocusOut>", lambda e: self._set("ping_host", self.host_var.get().strip()))
-        ttk.Label(nf, text="(game server IP, or 1.1.1.1)",
-                  foreground="#888888").grid(row=1, column=0, columnspan=2, sticky="w")
+        ttk.Label(nf, text="Auto pings the server your game is connected to.\n"
+                           "The status bar below shows which address is used.",
+                  foreground="#888888").grid(row=2, column=0, columnspan=2, sticky="w")
 
         # --- buttons + status ---
         bf = ttk.Frame(main)
