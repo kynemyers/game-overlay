@@ -17,6 +17,7 @@ if (-not (Test-Path $out) -or (Get-Item $src).LastWriteTime -gt (Get-Item $out).
 }
 
 & ".venv\Scripts\pyinstaller.exe" --noconfirm --onefile --noconsole --name GameOverlay `
+    --icon "icon.ico" `
     --add-binary "bin\PresentMon.exe;bin" `
     --add-binary "bin\HardwareMonitor.exe;bin" `
     --add-data   "bin\HardwareMonitor.exe.config;bin" `

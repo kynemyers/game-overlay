@@ -1,5 +1,7 @@
 # GameOverlay
 
+![GameOverlay](assets/banner.png)
+
 A lightweight, fully customisable in-game performance overlay for Windows.
 
 Shows, in an always-on-top click-through overlay:
