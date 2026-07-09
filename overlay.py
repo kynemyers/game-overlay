@@ -612,7 +612,9 @@ class FpsWorker(threading.Thread):
         threading.Thread(target=self._err_reader, args=(self.proc,), daemon=True).start()
 
     def _reader(self, proc):
-        ft_col = None  # index of the MsBetweenPresents column in this session
+        ft_col = None      # index of the MsBetweenPresents column in this session
+        fg = True          # is the game currently the foreground window?
+        last_fg_check = 0.0
         try:
             for line in proc.stdout:
                 if not RUNNING.is_set():
@@ -624,6 +626,17 @@ class FpsWorker(threading.Thread):
                     ft_col = cols.index("MsBetweenPresents") \
                         if "MsBetweenPresents" in cols else None
                     continue
+                now = time.time()
+                # When you alt-tab out, the game renders throttled background
+                # frames (~30fps) that you never actually saw - counting them
+                # would wreck the 1%/0.1% lows. Only keep frames rendered while
+                # the game is the foreground window. Checked ~4x/sec (cheap but
+                # not per-frame at hundreds of fps).
+                if now - last_fg_check >= 0.25:
+                    fg = (foreground_pid() == self.target_pid)
+                    last_fg_check = now
+                if not fg:
+                    continue
                 ft = None
                 if ft_col is not None:
                     parts = line.split(",")
@@ -633,7 +646,7 @@ class FpsWorker(threading.Thread):
                         except ValueError:
                             ft = None  # e.g. "NA" on the first frame
                 with self._frames_lock:
-                    self.samples.append((time.time(), ft))
+                    self.samples.append((now, ft))
         except (OSError, ValueError):
             pass
 
