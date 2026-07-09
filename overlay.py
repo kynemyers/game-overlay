@@ -355,7 +355,8 @@ IGNORED_PROCS = {
     "chrome.exe", "msedge.exe", "firefox.exe", "opera.exe", "opera_gx.exe",
     "brave.exe", "vivaldi.exe", "discord.exe", "steam.exe", "steamwebhelper.exe",
     "epicgameslauncher.exe", "battle.net.exe", "claude.exe", "spotify.exe",
-    "slack.exe",
+    "slack.exe", "whatsapp.exe", "whatsapp.root.exe", "telegram.exe",
+    "signal.exe", "teams.exe", "ms-teams.exe", "messenger.exe",
 }
 
 
