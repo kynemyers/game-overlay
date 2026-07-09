@@ -166,6 +166,8 @@ class PingWorker(threading.Thread):
         self.candidates = []
         self.cand_idx = 0
         self.last_detect = 0.0
+        self._cand_lock = threading.Lock()
+        self._detecting = False
 
     def run(self):
         while RUNNING.is_set():
@@ -200,42 +202,146 @@ class PingWorker(threading.Thread):
         if self.cfg.get("ping_mode", "auto") != "auto":
             return manual, "custom"
         now = time.time()
-        if now - self.last_detect >= self.DETECT_EVERY:
+        if now - self.last_detect >= self.DETECT_EVERY and not self._detecting:
             self.last_detect = now
-            found = self._detect_game_server()
-            if found != self.candidates:
-                self.candidates = found
-                self.cand_idx = 0
-        if self.candidates:
-            return self.candidates[self.cand_idx % len(self.candidates)], "auto"
+            self._detecting = True
+            threading.Thread(target=self._detect_bg, daemon=True).start()
+        with self._cand_lock:
+            cands = list(self.candidates)
+        if cands:
+            return cands[self.cand_idx % len(cands)], "auto"
         return manual, "fallback"
 
-    @staticmethod
-    def _detect_game_server():
-        """Public IPv4 addresses the game process talks to, most-used first."""
+    def _detect_bg(self):
+        """Detection samples live traffic for ~2s, so it runs off-thread."""
+        try:
+            found = self._detect_game_server()
+            pid = STATS.game_pid
+            game_alive = bool(pid and psutil and psutil.pid_exists(pid))
+            with self._cand_lock:
+                if found and found != self.candidates:
+                    self.candidates = found
+                    self.cand_idx = 0
+                elif not game_alive:
+                    self.candidates = []  # game closed - stop pinging its server
+        finally:
+            self._detecting = False
+
+    @classmethod
+    def _detect_game_server(cls):
+        """Find the game server's public IPv4, busiest traffic first.
+
+        Windows never exposes remote addresses for UDP sockets, and game
+        traffic is almost always UDP - so we take the game's local UDP port
+        numbers and sample real packets for 2s with a raw socket (needs
+        admin): whichever public IP exchanges the most packets on those
+        ports is the server. TCP connections are appended as a fallback.
+        """
         pid = STATS.game_pid
         if not pid or not psutil or not psutil.pid_exists(pid):
             return []
+        ordered = cls._sniff_udp_peers(cls._game_udp_ports(pid))
+        ordered += [ip for ip in cls._tcp_remotes(pid) if ip not in ordered]
+        return ordered
+
+    @staticmethod
+    def _game_udp_ports(pid):
+        """Local UDP port numbers used by the game and its child processes."""
+        ports = set()
+        try:
+            procs = [psutil.Process(pid)]
+            procs += procs[0].children(recursive=True)
+        except psutil.Error:
+            return ports
+        for p in procs:
+            try:
+                get_conns = getattr(p, "net_connections", None) or p.connections
+                for c in get_conns(kind="inet4"):
+                    if c.type == socket.SOCK_DGRAM and c.laddr:
+                        ports.add(c.laddr.port)
+            except psutil.Error:
+                continue
+        return ports
+
+    @staticmethod
+    def _sniff_udp_peers(ports, duration=2.0):
+        """Sample UDP traffic on the game's ports; public peers, busiest first."""
+        if not ports:
+            return []
+        probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            probe.connect(("8.8.8.8", 53))
+            local_ip = probe.getsockname()[0]
+        except OSError:
+            return []
+        finally:
+            probe.close()
+        counts = Counter()
+        s = None
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_IP)
+            s.bind((local_ip, 0))
+            s.ioctl(socket.SIO_RCVALL, socket.RCVALL_ON)
+            s.settimeout(0.25)
+            deadline = time.time() + duration
+            while time.time() < deadline and RUNNING.is_set():
+                try:
+                    data = s.recv(65535)
+                except socket.timeout:
+                    continue
+                if len(data) < 28 or data[9] != 17:  # not UDP
+                    continue
+                ihl = (data[0] & 0x0F) * 4
+                if len(data) < ihl + 8:
+                    continue
+                sport = int.from_bytes(data[ihl:ihl + 2], "big")
+                dport = int.from_bytes(data[ihl + 2:ihl + 4], "big")
+                if dport in ports:        # inbound packet -> peer is source
+                    peer = data[12:16]
+                elif sport in ports:      # outbound packet -> peer is dest
+                    peer = data[16:20]
+                else:
+                    continue
+                counts[socket.inet_ntoa(peer)] += 1
+        except OSError:  # no admin rights or odd network setup
+            return []
+        finally:
+            if s is not None:
+                try:
+                    s.ioctl(socket.SIO_RCVALL, socket.RCVALL_OFF)
+                except OSError:
+                    pass
+                s.close()
+        result = []
+        for ip, n in counts.most_common():
+            if n < 8:  # sustained flow only, not a stray DNS lookup
+                break
+            try:
+                if ipaddress.ip_address(ip).is_global:
+                    result.append(ip)
+            except ValueError:
+                continue
+        return result
+
+    @staticmethod
+    def _tcp_remotes(pid):
+        """Established public TCP remotes of the game (lobby servers etc.)."""
         try:
             proc = psutil.Process(pid)
             get_conns = getattr(proc, "net_connections", None) or proc.connections
-            conns = get_conns(kind="inet")
+            conns = get_conns(kind="tcp4")
         except psutil.Error:
             return []
-        udp, tcp = [], []
+        remotes = []
         for c in conns:
-            if not c.raddr:
+            if not c.raddr or c.status != psutil.CONN_ESTABLISHED:
                 continue
             try:
-                ip = ipaddress.ip_address(c.raddr.ip)
+                if ipaddress.ip_address(c.raddr.ip).is_global:
+                    remotes.append(c.raddr.ip)
             except ValueError:
                 continue
-            if ip.version != 4 or not ip.is_global:
-                continue
-            (udp if c.type == socket.SOCK_DGRAM else tcp).append(c.raddr.ip)
-        ordered = [ip for ip, _ in Counter(udp).most_common()]
-        ordered += [ip for ip, _ in Counter(tcp).most_common() if ip not in ordered]
-        return ordered
+        return [ip for ip, _ in Counter(remotes).most_common()]
 
     @staticmethod
     def _ping_once(host):

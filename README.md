@@ -43,9 +43,11 @@ and is the default in most modern games). FPS capture works in any mode.
 ### Ping
 
 In **Auto** mode (the default) the overlay finds the server your game is actually
-connected to — it reads the game process's network connections and pings that address,
-so the ping changes when you switch servers/regions. If a server ignores pings (some
-block ICMP), the overlay automatically tries the game's other remote addresses.
+connected to: it looks up the game's local UDP ports, samples 2 seconds of real network
+traffic (Windows doesn't expose UDP remote addresses any other way), and pings whichever
+public address the game is exchanging the most packets with. The ping therefore changes
+when you switch servers/regions. If a server ignores pings (some block ICMP), the overlay
+automatically tries the game's other remote addresses.
 
 You can switch to a fixed **Custom host** in Settings → Network. When no game is
 detected, auto mode falls back to the custom host (default `1.1.1.1`). Packet loss is
