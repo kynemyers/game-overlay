@@ -156,6 +156,7 @@ class PingWorker(threading.Thread):
     """
 
     DETECT_EVERY = 10  # rescan the game's connections every N seconds
+    MIN_LOSS_SAMPLES = 10  # don't report loss % from a tiny sample
 
     def __init__(self, cfg):
         super().__init__(daemon=True)
@@ -176,8 +177,11 @@ class PingWorker(threading.Thread):
             success, ms = self._ping_once(host)
             self.history.append((success, ms))
             if any(ok for ok, _ in self.history):
-                fails = sum(1 for ok, _ in self.history if not ok)
-                loss = 100.0 * fails / len(self.history)
+                if len(self.history) >= self.MIN_LOSS_SAMPLES:
+                    fails = sum(1 for ok, _ in self.history if not ok)
+                    loss = 100.0 * fails / len(self.history)
+                else:
+                    loss = None  # window too small - one drop would look huge
                 last_ok = next((m for ok, m in reversed(self.history) if ok), None)
                 STATS.ping_status = "%s (%s)" % (host, source)
             else:
