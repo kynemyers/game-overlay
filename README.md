@@ -6,7 +6,8 @@ A lightweight, fully customisable in-game performance overlay for Windows.
 
 Shows, in an always-on-top click-through overlay:
 
-- **FPS** (via Intel PresentMon, bundled)
+- **FPS**, plus **1% low** and **0.1% low** FPS (via Intel PresentMon, bundled) — the
+  lows are derived from real frame times and reveal stutter that average FPS hides
 - **Ping** and **packet loss** (to any host you choose — your game server IP or 1.1.1.1)
 - **CPU usage** and **CPU temperature**
 - **GPU usage** and **GPU temperature** (AMD, NVIDIA and Intel GPUs, via LibreHardwareMonitor)
@@ -86,7 +87,10 @@ This creates a venv, installs PyInstaller, and produces `dist\GameOverlay.exe`.
   prints CPU/GPU sensor JSON once a second. Compiled with the `csc.exe` that ships with
   Windows, so no .NET SDK is needed.
 - FPS comes from [Intel PresentMon](https://github.com/GameTechDev/PresentMon): every CSV
-  row it emits is one presented frame, so FPS = rows per second.
+  row it emits is one presented frame, and its `MsBetweenPresents` column is that frame's
+  time. Average FPS is frames-per-second over a 2 s window; the **1% / 0.1% lows** are
+  `1000 / p99` and `1000 / p99.9` of the frame times over a 60 s window — i.e. the frame
+  rate during your worst 1% (and worst 0.1%) of frames, which is what stutter feels like.
 
 ## Licence
 

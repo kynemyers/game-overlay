@@ -12,6 +12,7 @@ import atexit
 import ctypes
 import ipaddress
 import json
+import math
 import os
 import re
 import socket
@@ -50,7 +51,8 @@ CONFIG_FILE = os.path.join(CONFIG_DIR, "config.json")
 
 # --------------------------------------------------------------- config ----
 
-METRIC_ORDER = ["fps", "ping", "loss", "cpu", "cpu_temp", "gpu", "gpu_temp"]
+METRIC_ORDER = ["fps", "fps_low", "fps_low01", "ping", "loss",
+                "cpu", "cpu_temp", "gpu", "gpu_temp"]
 
 DEFAULT_CONFIG = {
     "position": "Top Right",
@@ -63,18 +65,22 @@ DEFAULT_CONFIG = {
     "ping_mode": "auto",
     "ping_host": "1.1.1.1",
     "metrics": {
-        "fps":      {"enabled": True, "label": "FPS",  "color": "#00ff88"},
-        "ping":     {"enabled": True, "label": "PING", "color": "#00ccff"},
-        "loss":     {"enabled": True, "label": "LOSS", "color": "#ff5555"},
-        "cpu":      {"enabled": True, "label": "CPU",  "color": "#ffcc00"},
-        "cpu_temp": {"enabled": True, "label": "CPU°", "color": "#ff9933"},
-        "gpu":      {"enabled": True, "label": "GPU",  "color": "#cc66ff"},
-        "gpu_temp": {"enabled": True, "label": "GPU°", "color": "#ff6699"},
+        "fps":       {"enabled": True,  "label": "FPS",     "color": "#00ff88"},
+        "fps_low":   {"enabled": True,  "label": "1% LOW",  "color": "#00e0a0"},
+        "fps_low01": {"enabled": False, "label": "0.1% LOW", "color": "#7fffd4"},
+        "ping":      {"enabled": True,  "label": "PING",    "color": "#00ccff"},
+        "loss":      {"enabled": True,  "label": "LOSS",    "color": "#ff5555"},
+        "cpu":       {"enabled": True,  "label": "CPU",     "color": "#ffcc00"},
+        "cpu_temp":  {"enabled": True,  "label": "CPU°",    "color": "#ff9933"},
+        "gpu":       {"enabled": True,  "label": "GPU",     "color": "#cc66ff"},
+        "gpu_temp":  {"enabled": True,  "label": "GPU°",    "color": "#ff6699"},
     },
 }
 
 METRIC_NAMES = {
     "fps": "FPS",
+    "fps_low": "1% low FPS",
+    "fps_low01": "0.1% low FPS",
     "ping": "Ping",
     "loss": "Packet loss",
     "cpu": "CPU usage",
@@ -504,21 +510,36 @@ def foreground_pid():
 
 
 class FpsWorker(threading.Thread):
-    """Attaches Intel PresentMon to the foreground game and counts presents.
+    """Attaches Intel PresentMon to the foreground game and reads frame times.
 
-    Each CSV row PresentMon emits is one presented frame, so FPS is simply
-    rows-per-second (averaged over a 2 second window).
+    Each CSV row PresentMon emits is one presented frame; the MsBetweenPresents
+    column is that frame's time in milliseconds. Average FPS is frames-per-
+    second over a short window; the 1% / 0.1% lows are derived from the worst
+    (longest) frame times over a longer window - the number that reflects
+    stutter, which average FPS hides.
     """
 
-    WINDOW = 2.0
+    AVG_WINDOW = 2.0    # seconds, for the responsive average FPS number
+    LOW_WINDOW = 60.0   # seconds of frame times feeding the 1% / 0.1% lows
+    MIN_LOW_FRAMES = 120     # need a real sample before showing a 1% low
+    MIN_LOW01_FRAMES = 1000  # 0.1% low needs ~1000+ frames to mean anything
 
     def __init__(self):
         super().__init__(daemon=True)
         self.proc = None
         self.target_pid = None
         self.target_name = None
-        self.frames = deque()
+        self.samples = deque()  # (timestamp, frametime_ms or None)
         self._frames_lock = threading.Lock()
+
+    @staticmethod
+    def _percentile(sorted_vals, pct):
+        """Nearest-rank percentile of an ascending-sorted list."""
+        if not sorted_vals:
+            return None
+        k = int(math.ceil(pct / 100.0 * len(sorted_vals))) - 1
+        k = max(0, min(len(sorted_vals) - 1, k))
+        return sorted_vals[k]
 
     def run(self):
         exe = resource_path(os.path.join("bin", "PresentMon.exe"))
@@ -527,15 +548,31 @@ class FpsWorker(threading.Thread):
             return
         while RUNNING.is_set():
             self._maybe_retarget(exe)
-            with self._frames_lock:
-                now = time.time()
-                while self.frames and now - self.frames[0] > self.WINDOW:
-                    self.frames.popleft()
-                fps = len(self.frames) / self.WINDOW if self.frames else None
-            if self.proc is None or self.proc.poll() is not None:
-                fps = None
-            STATS.set(fps=fps)
+            fps = fps_low = fps_low01 = None
+            if self.proc is not None and self.proc.poll() is None:
+                fps, fps_low, fps_low01 = self._compute()
+            STATS.set(fps=fps, fps_low=fps_low, fps_low01=fps_low01)
             time.sleep(1.0)
+
+    def _compute(self):
+        now = time.time()
+        with self._frames_lock:
+            while self.samples and now - self.samples[0][0] > self.LOW_WINDOW:
+                self.samples.popleft()
+            recent = sum(1 for ts, _ in self.samples if now - ts <= self.AVG_WINDOW)
+            frametimes = sorted(ft for _, ft in self.samples if ft is not None)
+        fps = recent / self.AVG_WINDOW if recent else None
+        fps_low = fps_low01 = None
+        n = len(frametimes)
+        if n >= self.MIN_LOW_FRAMES:
+            p99 = self._percentile(frametimes, 99.0)  # worst-1% frame time
+            if p99 and p99 > 0:
+                fps_low = 1000.0 / p99
+        if n >= self.MIN_LOW01_FRAMES:
+            p999 = self._percentile(frametimes, 99.9)  # worst-0.1% frame time
+            if p999 and p999 > 0:
+                fps_low01 = 1000.0 / p999
+        return fps, fps_low, fps_low01
 
     def _maybe_retarget(self, exe):
         pid = foreground_pid()
@@ -557,7 +594,7 @@ class FpsWorker(threading.Thread):
         self.target_pid, self.target_name = pid, name
         STATS.game_pid = pid
         with self._frames_lock:
-            self.frames.clear()
+            self.samples.clear()
         try:
             self.proc = subprocess.Popen(
                 [exe, "--process_id", str(pid), "--output_stdout",
@@ -575,14 +612,28 @@ class FpsWorker(threading.Thread):
         threading.Thread(target=self._err_reader, args=(self.proc,), daemon=True).start()
 
     def _reader(self, proc):
+        ft_col = None  # index of the MsBetweenPresents column in this session
         try:
             for line in proc.stdout:
                 if not RUNNING.is_set():
                     return
-                if line.startswith("Application") or not line.strip():
-                    continue  # CSV header / blank
+                if not line.strip():
+                    continue
+                if line.startswith("Application"):  # CSV header
+                    cols = line.strip().split(",")
+                    ft_col = cols.index("MsBetweenPresents") \
+                        if "MsBetweenPresents" in cols else None
+                    continue
+                ft = None
+                if ft_col is not None:
+                    parts = line.split(",")
+                    if len(parts) > ft_col:
+                        try:
+                            ft = float(parts[ft_col])
+                        except ValueError:
+                            ft = None  # e.g. "NA" on the first frame
                 with self._frames_lock:
-                    self.frames.append(time.time())
+                    self.samples.append((time.time(), ft))
         except (OSError, ValueError):
             pass
 
@@ -611,7 +662,7 @@ def format_value(metric, stats):
     val = stats.get(metric)
     if val is None:
         return "--"
-    if metric == "fps":
+    if metric in ("fps", "fps_low", "fps_low01"):
         return "%d" % round(val)
     if metric == "ping":
         return "%d ms" % round(val)
