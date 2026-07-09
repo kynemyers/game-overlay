@@ -174,6 +174,18 @@ class PingWorker(threading.Thread):
         while RUNNING.is_set():
             start = time.time()
             host, source = self._choose_host()
+
+            if host is None:
+                # Auto mode, no active game connection - show -- like FPS
+                # does, instead of quietly pinging some unrelated host.
+                if self.cur_host is not None:
+                    self.cur_host = None
+                    self.history.clear()
+                STATS.set(ping=None, loss=None)
+                STATS.ping_status = "waiting for a game"
+                time.sleep(max(0.0, 1.0 - (time.time() - start)))
+                continue
+
             if host != self.cur_host:
                 self.cur_host = host
                 self.history.clear()
@@ -200,8 +212,8 @@ class PingWorker(threading.Thread):
             time.sleep(max(0.0, 1.0 - (time.time() - start)))
 
     def _choose_host(self):
-        manual = (self.cfg.get("ping_host") or "1.1.1.1").strip() or "1.1.1.1"
         if self.cfg.get("ping_mode", "auto") != "auto":
+            manual = (self.cfg.get("ping_host") or "1.1.1.1").strip() or "1.1.1.1"
             return manual, "custom"
         now = time.time()
         if now - self.last_detect >= self.DETECT_EVERY and not self._detecting:
@@ -212,7 +224,7 @@ class PingWorker(threading.Thread):
             cands = list(self.candidates)
         if cands:
             return cands[self.cand_idx % len(cands)], "auto"
-        return manual, "fallback"
+        return None, "none"  # no game connection detected - show --, don't probe anything
 
     STALE_AFTER_SCANS = 2  # ~2 quiet detection cycles (~20s) -> drop last known server
 
@@ -813,8 +825,9 @@ class SettingsWindow:
         he.grid(row=1, column=1, sticky="w", padx=8)
         he.bind("<Return>", lambda e: self._set("ping_host", self.host_var.get().strip()))
         he.bind("<FocusOut>", lambda e: self._set("ping_host", self.host_var.get().strip()))
-        ttk.Label(nf, text="Auto pings the server your game is connected to.\n"
-                           "The status bar below shows which address is used.",
+        ttk.Label(nf, text="Auto pings the server your game is connected to, and\n"
+                           "shows -- when you're not in a game. The status bar\n"
+                           "below shows which address is used.",
                   foreground="#888888").grid(row=2, column=0, columnspan=2, sticky="w")
 
         # --- buttons + status ---

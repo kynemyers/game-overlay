@@ -51,10 +51,13 @@ public address the game is exchanging the most packets with. The ping therefore 
 when you switch servers/regions. If a server ignores pings (some block ICMP), the overlay
 automatically tries the game's other remote addresses.
 
-You can switch to a fixed **Custom host** in Settings → Network. When no game is
-detected, auto mode falls back to the custom host (default `1.1.1.1`). Packet loss is
-measured over the last ~50 pings. The status bar in the settings window shows exactly
-which address is being pinged.
+FPS, ping and loss all show `--` whenever you're not actively in a game — same as FPS,
+auto-mode ping only ever probes a server while it can see you're connected to one, so it
+never pings some unrelated address in the background. If you want a ping reading even
+when you're not in a game, switch to a fixed **Custom host** in Settings → Network (that
+mode always pings the address you enter). Packet loss is measured over the last ~50
+pings, once at least 10 have been collected. The status bar in the settings window shows
+exactly which address is being pinged.
 
 ## Running from source
 
