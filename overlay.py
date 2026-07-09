@@ -178,17 +178,18 @@ class PingWorker(threading.Thread):
                 self.history.clear()
             success, ms = self._ping_once(host)
             self.history.append((success, ms))
+
+            # Loss depends only on sample count, not on whether the host has
+            # ever replied - a fully dead host must still show 100%, not --.
+            loss = None
+            if len(self.history) >= self.MIN_LOSS_SAMPLES:
+                fails = sum(1 for ok, _ in self.history if not ok)
+                loss = 100.0 * fails / len(self.history)
+            last_ok = next((m for ok, m in reversed(self.history) if ok), None)
+
             if any(ok for ok, _ in self.history):
-                if len(self.history) >= self.MIN_LOSS_SAMPLES:
-                    fails = sum(1 for ok, _ in self.history if not ok)
-                    loss = 100.0 * fails / len(self.history)
-                else:
-                    loss = None  # window too small - one drop would look huge
-                last_ok = next((m for ok, m in reversed(self.history) if ok), None)
                 STATS.ping_status = "%s (%s)" % (host, source)
             else:
-                loss = None
-                last_ok = None
                 STATS.ping_status = "%s (%s) not answering" % (host, source)
                 if source == "auto" and len(self.history) >= 5:
                     # server ignores ICMP - try the game's next remote address
