@@ -18,15 +18,34 @@ font, font size, opacity, and toggle the background box.
 
 ## Download
 
-Grab **GameOverlay.exe** from the
-[latest release](../../releases/latest) — no install needed, just run it.
+From the [latest release](../../releases/latest), pick one:
+
+- **GameOverlay.exe** — single file, just run it. Most convenient.
+- **GameOverlay-folder.zip** — unzip and run `GameOverlay.exe` inside. **Use this one if
+  your antivirus flags the single-file exe** (see below) — this build does not self-extract,
+  so it trips far fewer scanners.
 
 > **First run notes**
 > - Windows SmartScreen may warn about an unknown publisher: click **More info → Run anyway**.
 > - The app asks for **administrator access** (UAC prompt). This is required to read CPU
 >   temperature sensors and to capture FPS — decline it and those metrics show `--`.
-> - Some antivirus tools flag PyInstaller-packed exes as suspicious. It's a false positive;
->   you can build the exe yourself from this source (see below) if you prefer.
+
+### Antivirus false positives
+
+The single-file exe is built with PyInstaller and is **not signed** (code-signing
+certificates cost money). Some antivirus / VPN "threat protection" tools flag unsigned
+self-extracting exes by heuristic — it is a **false positive**, and the entire source is
+in this repo so you can verify it. If your AV blocks or deletes the download, in order of
+easiest first:
+
+1. **Use `GameOverlay-folder.zip`** instead of the single exe — the onedir build does not
+   self-extract and is flagged far less often.
+2. **Add an exclusion** for the file/folder in your antivirus or VPN threat-protection
+   settings, and restore it from quarantine.
+3. **Run from source** — no packed exe at all, so there is nothing to flag. Download this
+   repo (green *Code* button → *Download ZIP*), install
+   [Python 3.10+](https://www.python.org/downloads/) (tick *Add python.exe to PATH*), then
+   double-click **`run_from_source.bat`**.
 
 ## Usage
 
