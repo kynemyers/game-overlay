@@ -176,6 +176,8 @@ class PingWorker(threading.Thread):
         self._cand_lock = threading.Lock()
         self._detecting = False
         self._empty_scans = 0
+        self._hops = {}        # server ip -> last responding hop ip (or None)
+        self._tracing = set()  # servers a traceroute is running for
 
     def run(self):
         while RUNNING.is_set():
@@ -212,17 +214,31 @@ class PingWorker(threading.Thread):
                 # We can see the game exchanging packets with this server, so
                 # the connection is plainly fine - the server is just refusing
                 # ICMP (very common; COD and many others drop ping and TCP
-                # entirely). Reporting 100% loss here is a false alarm, so
-                # report nothing and say why.
-                STATS.set(ping=None, loss=None)
-                STATS.ping_status = "%s (auto) - server blocks ping" % host
-                with self._cand_lock:
-                    n_cands = len(self.candidates)
-                if n_cands > 1:
-                    self.cand_idx += 1   # another address might answer
-                    self.history.clear()
+                # entirely). Never report that as 100% loss.
+                #
+                # Routers *on the way* to the server usually do answer, and the
+                # last one that does is normally in the server's own
+                # datacentre - so its round-trip is a good approximation of
+                # real ping. Shown with a ~ so it is never mistaken for exact.
+                hop = self._hops.get(host, "pending")
+                if hop == "pending":
+                    self._start_trace(host)
+                    STATS.set(ping=None, loss=None)
+                    STATS.ping_status = "%s - blocks ping, tracing route..." % host
+                elif hop:
+                    ok, ms = self._ping_once(hop)
+                    if ok:
+                        STATS.set(ping=ms, ping_approx=True, loss=None)
+                        STATS.ping_status = "~%s via %s (server blocks ping)" % (host, hop)
+                    else:
+                        STATS.set(ping=None, loss=None)
+                        STATS.ping_status = "%s - blocks ping (hop unreachable)" % host
+                else:
+                    STATS.set(ping=None, loss=None)
+                    STATS.ping_status = "%s - server blocks ping" % host
                 time.sleep(max(0.0, 1.0 - (time.time() - start)))
                 continue
+            STATS.set(ping_approx=False)
 
             # Loss is only meaningful against a host that does answer pings;
             # otherwise we cannot tell loss apart from an ICMP-blocking host.
@@ -432,6 +448,40 @@ class PingWorker(threading.Thread):
             except ValueError:
                 continue
         return result
+
+    def _start_trace(self, server):
+        """Trace toward an unpingable server to find the closest hop that answers."""
+        if server in self._tracing:
+            return
+        self._tracing.add(server)
+
+        def worker():
+            hop = None
+            try:
+                out = subprocess.run(
+                    ["tracert", "-d", "-h", "24", "-w", "600", server],
+                    capture_output=True, text=True, timeout=120,
+                    creationflags=CREATE_NO_WINDOW,
+                )
+                for line in (out.stdout or "").splitlines():
+                    m = re.search(r"(\d+\.\d+\.\d+\.\d+)\s*$", line.strip())
+                    if not m:
+                        continue
+                    ip = m.group(1)
+                    if ip == server:
+                        continue  # the server itself answered; not our case
+                    try:
+                        if ipaddress.ip_address(ip).is_global:
+                            hop = ip  # keep the furthest public responder
+                    except ValueError:
+                        continue
+            except (OSError, subprocess.TimeoutExpired, subprocess.SubprocessError):
+                pass
+            finally:
+                self._hops[server] = hop
+                self._tracing.discard(server)
+
+        threading.Thread(target=worker, daemon=True).start()
 
     @staticmethod
     def _ping_once(host):
@@ -740,7 +790,9 @@ def format_value(metric, stats):
     if metric in ("fps", "fps_low", "fps_low01"):
         return "%d" % round(val)
     if metric == "ping":
-        return "%d ms" % round(val)
+        # "~" marks a value measured against the closest router that answers,
+        # used when the game server itself refuses to be pinged.
+        return "%s%d ms" % ("~" if stats.get("ping_approx") else "", round(val))
     if metric == "loss":
         return "%.1f %%" % val
     if metric in ("cpu", "gpu"):
