@@ -597,7 +597,13 @@ class FpsWorker(threading.Thread):
                 self.samples.popleft()
             recent = sum(1 for ts, _ in self.samples if now - ts <= self.AVG_WINDOW)
             frametimes = sorted(ft for _, ft in self.samples if ft is not None)
-        fps = recent / self.AVG_WINDOW if recent else None
+        if not recent:
+            # Nothing rendered in the last couple of seconds (alt-tabbed or
+            # sitting in a menu). Blank the lows too: showing a stale 1% low
+            # from a minute ago next to an empty FPS reads as a broken
+            # overlay, and the number no longer describes what you're doing.
+            return None, None, None
+        fps = recent / self.AVG_WINDOW
         fps_low = fps_low01 = None
         n = len(frametimes)
         if n >= self.MIN_LOW_FRAMES:

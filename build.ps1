@@ -1,8 +1,41 @@
 # Builds two artifacts in dist\:
 #   GameOverlay.exe            - single-file (convenient, but more AV false positives)
 #   GameOverlay-folder.zip     - onedir build (does NOT self-extract; far fewer AV flags)
+#
+# Usage: .\build.ps1 [-Version 1.0.16]
+param([string]$Version = "")
 $ErrorActionPreference = "Stop"
 Set-Location $PSScriptRoot
+
+# Version stamped into the exe. Defaults to the newest git tag so the
+# metadata cannot silently go stale against what is actually shipped.
+if (-not $Version) {
+    $tag = (git describe --tags --abbrev=0 2>$null)
+    if ($tag) { $Version = $tag -replace '^v', '' } else { $Version = "0.0.0" }
+}
+$parts = ($Version -split '\.') + @("0", "0", "0", "0")
+$vtuple = "$($parts[0]), $($parts[1]), $($parts[2]), 0"
+@"
+VSVersionInfo(
+  ffi=FixedFileInfo(
+    filevers=($vtuple), prodvers=($vtuple),
+    mask=0x3f, flags=0x0, OS=0x40004, fileType=0x1, subtype=0x0, date=(0, 0)
+  ),
+  kids=[
+    StringFileInfo([StringTable(u'040904B0', [
+      StringStruct(u'CompanyName', u'kynemyers'),
+      StringStruct(u'FileDescription', u'GameOverlay - in-game performance overlay'),
+      StringStruct(u'FileVersion', u'$Version.0'),
+      StringStruct(u'InternalName', u'GameOverlay'),
+      StringStruct(u'LegalCopyright', u'MIT License. Open source: github.com/kynemyers/game-overlay'),
+      StringStruct(u'OriginalFilename', u'GameOverlay.exe'),
+      StringStruct(u'ProductName', u'GameOverlay'),
+      StringStruct(u'ProductVersion', u'$Version.0')])]),
+    VarFileInfo([VarStruct(u'Translation', [1033, 1200])])
+  ]
+)
+"@ | Set-Content "assets\version_info.txt" -Encoding utf8
+Write-Output "Stamping version $Version"
 
 if (-not (Test-Path ".venv")) {
     python -m venv .venv
