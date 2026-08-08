@@ -163,6 +163,7 @@ class PingWorker(threading.Thread):
 
     DETECT_EVERY = 10  # rescan the game's connections every N seconds
     MIN_LOSS_SAMPLES = 10  # don't report loss % from a tiny sample
+    SILENT_AFTER = 5   # probes with no reply before calling a server ICMP-blocked
 
     def __init__(self, cfg):
         super().__init__(daemon=True)
@@ -204,22 +205,41 @@ class PingWorker(threading.Thread):
             success, ms = self._ping_once(host)
             self.history.append((success, ms))
 
-            # Loss depends only on sample count, not on whether the host has
-            # ever replied - a fully dead host must still show 100%, not --.
+            answered = any(ok for ok, _ in self.history)
+            silent = not answered and len(self.history) >= self.SILENT_AFTER
+
+            if silent and source == "auto":
+                # We can see the game exchanging packets with this server, so
+                # the connection is plainly fine - the server is just refusing
+                # ICMP (very common; COD and many others drop ping and TCP
+                # entirely). Reporting 100% loss here is a false alarm, so
+                # report nothing and say why.
+                STATS.set(ping=None, loss=None)
+                STATS.ping_status = "%s (auto) - server blocks ping" % host
+                with self._cand_lock:
+                    n_cands = len(self.candidates)
+                if n_cands > 1:
+                    self.cand_idx += 1   # another address might answer
+                    self.history.clear()
+                time.sleep(max(0.0, 1.0 - (time.time() - start)))
+                continue
+
+            # Loss is only meaningful against a host that does answer pings;
+            # otherwise we cannot tell loss apart from an ICMP-blocking host.
             loss = None
-            if len(self.history) >= self.MIN_LOSS_SAMPLES:
+            if answered and len(self.history) >= self.MIN_LOSS_SAMPLES:
                 fails = sum(1 for ok, _ in self.history if not ok)
                 loss = 100.0 * fails / len(self.history)
+            elif not answered and len(self.history) >= self.MIN_LOSS_SAMPLES:
+                # Custom host the user picked themselves: a host that never
+                # replies really is 100% unreachable, and they asked for that.
+                loss = 100.0
             last_ok = next((m for ok, m in reversed(self.history) if ok), None)
 
-            if any(ok for ok, _ in self.history):
+            if answered:
                 STATS.ping_status = "%s (%s)" % (host, source)
             else:
                 STATS.ping_status = "%s (%s) not answering" % (host, source)
-                if source == "auto" and len(self.history) >= 5:
-                    # server ignores ICMP - try the game's next remote address
-                    self.cand_idx += 1
-                    self.history.clear()
             STATS.set(ping=last_ok, loss=loss)
             time.sleep(max(0.0, 1.0 - (time.time() - start)))
 

@@ -71,6 +71,14 @@ public address the game is exchanging the most packets with. The ping therefore 
 when you switch servers/regions. If a server ignores pings (some block ICMP), the overlay
 automatically tries the game's other remote addresses.
 
+**Some games' servers cannot be pinged by any external tool.** Call of Duty is one:
+its servers drop ICMP *and* TCP entirely, and its UDP stream is not request/response
+shaped, so there is no way to derive latency from outside the game. When this is
+detected the status bar says *"server blocks ping"* and ping/loss show `--` rather than
+inventing a number or crying 100% packet loss — your connection is fine, the server just
+will not answer probes. Counter-Strike 2 and many other games do answer, and work
+normally. Use the in-game net graph for titles that block probing.
+
 FPS, ping and loss all show `--` whenever you're not actively in a game — same as FPS,
 auto-mode ping only ever probes a server while it can see you're connected to one, so it
 never pings some unrelated address in the background. If you want a ping reading even
