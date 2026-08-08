@@ -298,54 +298,101 @@ class PingWorker(threading.Thread):
         return ports
 
     @staticmethod
-    def _sniff_udp_peers(ports, duration=2.0):
-        """Sample UDP traffic on the game's ports; public peers, busiest first."""
-        if not ports:
-            return []
+    def _local_ipv4s():
+        """Every usable local IPv4, most-likely-default first.
+
+        A raw socket only captures traffic on the interface it is bound to,
+        so with a VPN (NordVPN/Wireguard etc.) or multiple NICs we must watch
+        all of them - the game's traffic may not be on the default route.
+        """
+        ips = []
         probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         try:
             probe.connect(("8.8.8.8", 53))
-            local_ip = probe.getsockname()[0]
+            ips.append(probe.getsockname()[0])  # default-route IP goes first
         except OSError:
-            return []
+            pass
         finally:
             probe.close()
-        counts = Counter()
-        s = None
         try:
-            s = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_IP)
-            s.bind((local_ip, 0))
-            s.ioctl(socket.SIO_RCVALL, socket.RCVALL_ON)
-            s.settimeout(0.25)
-            deadline = time.time() + duration
-            while time.time() < deadline and RUNNING.is_set():
+            for info in socket.getaddrinfo(socket.gethostname(), None,
+                                           socket.AF_INET):
+                ip = info[4][0]
+                if ip in ips:
+                    continue
                 try:
-                    data = s.recv(65535)
-                except socket.timeout:
+                    addr = ipaddress.ip_address(ip)
+                except ValueError:
                     continue
-                if len(data) < 28 or data[9] != 17:  # not UDP
-                    continue
-                ihl = (data[0] & 0x0F) * 4
-                if len(data) < ihl + 8:
-                    continue
-                sport = int.from_bytes(data[ihl:ihl + 2], "big")
-                dport = int.from_bytes(data[ihl + 2:ihl + 4], "big")
-                if dport in ports:        # inbound packet -> peer is source
-                    peer = data[12:16]
-                elif sport in ports:      # outbound packet -> peer is dest
-                    peer = data[16:20]
-                else:
-                    continue
-                counts[socket.inet_ntoa(peer)] += 1
-        except OSError:  # no admin rights or odd network setup
+                if addr.is_loopback or addr.is_link_local:
+                    continue  # 127.x and unconfigured 169.254.x adapters
+                ips.append(ip)
+        except OSError:
+            pass
+        return ips
+
+    @classmethod
+    def _sniff_udp_peers(cls, ports, duration=2.0):
+        """Sample UDP traffic on the game's ports; public peers, busiest first.
+
+        Captures on every local interface simultaneously so a VPN tunnel or
+        secondary NIC carrying the game traffic is not missed.
+        """
+        if not ports:
             return []
-        finally:
-            if s is not None:
-                try:
-                    s.ioctl(socket.SIO_RCVALL, socket.RCVALL_OFF)
-                except OSError:
-                    pass
-                s.close()
+        local_ips = cls._local_ipv4s()
+        if not local_ips:
+            return []
+        counts = Counter()
+        counts_lock = threading.Lock()
+
+        def capture(local_ip):
+            s = None
+            try:
+                s = socket.socket(socket.AF_INET, socket.SOCK_RAW,
+                                  socket.IPPROTO_IP)
+                s.bind((local_ip, 0))
+                s.ioctl(socket.SIO_RCVALL, socket.RCVALL_ON)
+                s.settimeout(0.25)
+                deadline = time.time() + duration
+                local = Counter()
+                while time.time() < deadline and RUNNING.is_set():
+                    try:
+                        data = s.recv(65535)
+                    except socket.timeout:
+                        continue
+                    if len(data) < 28 or data[9] != 17:  # not UDP
+                        continue
+                    ihl = (data[0] & 0x0F) * 4
+                    if len(data) < ihl + 8:
+                        continue
+                    sport = int.from_bytes(data[ihl:ihl + 2], "big")
+                    dport = int.from_bytes(data[ihl + 2:ihl + 4], "big")
+                    if dport in ports:        # inbound packet -> peer is source
+                        peer = data[12:16]
+                    elif sport in ports:      # outbound packet -> peer is dest
+                        peer = data[16:20]
+                    else:
+                        continue
+                    local[socket.inet_ntoa(peer)] += 1
+                with counts_lock:
+                    counts.update(local)
+            except OSError:
+                pass  # interface refuses raw capture (common on tunnels)
+            finally:
+                if s is not None:
+                    try:
+                        s.ioctl(socket.SIO_RCVALL, socket.RCVALL_OFF)
+                    except OSError:
+                        pass
+                    s.close()
+
+        threads = [threading.Thread(target=capture, args=(ip,), daemon=True)
+                   for ip in local_ips]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(duration + 2.0)
         result = []
         for ip, n in counts.most_common():
             if n < 8:  # sustained flow only, not a stray DNS lookup
