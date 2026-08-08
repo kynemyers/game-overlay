@@ -38,11 +38,27 @@ $common = @(
 
 # 1) single-file build -> dist\GameOverlay.exe
 & ".venv\Scripts\pyinstaller.exe" @common --onefile --distpath "dist" --workpath "build\onefile" overlay.py
+if ($LASTEXITCODE -ne 0) { throw "onefile build FAILED (exit $LASTEXITCODE)" }
 Write-Output "Built: $PSScriptRoot\dist\GameOverlay.exe"
 
-# 2) onedir build -> dist\onedir\GameOverlay\  ->  zipped for release
-& ".venv\Scripts\pyinstaller.exe" @common --onedir --distpath "dist\onedir" --workpath "build\onedir" overlay.py
+# 2) onedir build -> dist\onedir\GameOverlay\  ->  zipped for release.
+# Clear the old output first: OneDrive/AV can hold locks that make
+# PyInstaller's own cleanup fail, which would silently ship a stale zip.
+$onedir = "dist\onedir"
+if (Test-Path $onedir) {
+    Remove-Item $onedir -Recurse -Force -ErrorAction SilentlyContinue
+    Start-Sleep -Milliseconds 500
+    if (Test-Path $onedir) { throw "could not clear $onedir (file lock - close the app / pause OneDrive sync)" }
+}
+& ".venv\Scripts\pyinstaller.exe" @common --onedir --distpath $onedir --workpath "build\onedir" overlay.py
+if ($LASTEXITCODE -ne 0) { throw "onedir build FAILED (exit $LASTEXITCODE)" }
+
 $zip = "dist\GameOverlay-folder.zip"
 if (Test-Path $zip) { Remove-Item $zip -Force }
-Compress-Archive -Path "dist\onedir\GameOverlay\*" -DestinationPath $zip
+Compress-Archive -Path "$onedir\GameOverlay\*" -DestinationPath $zip
+# Sanity check: the zipped exe must match the freshly built one.
+$builtExe = Get-Item "$onedir\GameOverlay\GameOverlay.exe" -ErrorAction Stop
+if ($builtExe.LastWriteTime -lt (Get-Date).AddMinutes(-30)) {
+    throw "onedir exe looks stale ($($builtExe.LastWriteTime)) - aborting rather than shipping it"
+}
 Write-Output "Built: $PSScriptRoot\$zip  (antivirus-friendly onedir build)"

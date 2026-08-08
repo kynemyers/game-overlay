@@ -188,7 +188,13 @@ class PingWorker(threading.Thread):
                     self.cur_host = None
                     self.history.clear()
                 STATS.set(ping=None, loss=None)
-                STATS.ping_status = "waiting for a game"
+                pid = STATS.game_pid
+                if pid and psutil and psutil.pid_exists(pid):
+                    # Game is up but sending no gameplay traffic - almost
+                    # always a menu/lobby between matches.
+                    STATS.ping_status = "game open, no match traffic yet"
+                else:
+                    STATS.ping_status = "waiting for a game"
                 time.sleep(max(0.0, 1.0 - (time.time() - start)))
                 continue
 
@@ -265,18 +271,21 @@ class PingWorker(threading.Thread):
     def _detect_game_server(cls):
         """Find the game server's public IPv4, busiest traffic first.
 
-        Windows never exposes remote addresses for UDP sockets, and game
-        traffic is almost always UDP - so we take the game's local UDP port
-        numbers and sample real packets for 2s with a raw socket (needs
-        admin): whichever public IP exchanges the most packets on those
-        ports is the server. TCP connections are appended as a fallback.
+        Windows never exposes remote addresses for UDP sockets, and live
+        gameplay traffic is essentially always UDP - so we take the game's
+        local UDP port numbers and sample real packets with a raw socket
+        (needs admin): whichever public IP exchanges the most packets on
+        those ports is the server.
+
+        Deliberately UDP-only. A game's TCP connections go to CDN, auth and
+        matchmaking hosts (Akamai/Cloudflare/Google), not the match server -
+        pinging those produces a confident but meaningless number. Showing
+        -- until real gameplay traffic appears is the honest answer.
         """
         pid = STATS.game_pid
         if not pid or not psutil or not psutil.pid_exists(pid):
             return []
-        ordered = cls._sniff_udp_peers(cls._game_udp_ports(pid))
-        ordered += [ip for ip in cls._tcp_remotes(pid) if ip not in ordered]
-        return ordered
+        return cls._sniff_udp_peers(cls._game_udp_ports(pid))
 
     @staticmethod
     def _game_udp_ports(pid):
@@ -403,26 +412,6 @@ class PingWorker(threading.Thread):
             except ValueError:
                 continue
         return result
-
-    @staticmethod
-    def _tcp_remotes(pid):
-        """Established public TCP remotes of the game (lobby servers etc.)."""
-        try:
-            proc = psutil.Process(pid)
-            get_conns = getattr(proc, "net_connections", None) or proc.connections
-            conns = get_conns(kind="tcp4")
-        except psutil.Error:
-            return []
-        remotes = []
-        for c in conns:
-            if not c.raddr or c.status != psutil.CONN_ESTABLISHED:
-                continue
-            try:
-                if ipaddress.ip_address(c.raddr.ip).is_global:
-                    remotes.append(c.raddr.ip)
-            except ValueError:
-                continue
-        return [ip for ip, _ in Counter(remotes).most_common()]
 
     @staticmethod
     def _ping_once(host):
