@@ -116,6 +116,13 @@ This creates a venv, installs PyInstaller, and produces `dist\GameOverlay.exe`.
 
 - `overlay.py` — tkinter overlay (frameless, transparent, click-through via
   `WS_EX_TRANSPARENT`) plus the settings window and worker threads.
+- GPU usage and temperature have a **vendor-neutral fallback**. LibreHardwareMonitor goes
+  blind when a card is newer than the bundled sensor library or the vendor driver is
+  mid-update (an RX 9070 XT reports no GPU sensors at all in that state). When no GPU
+  temperature comes back, the overlay reads it from Windows instead — temperature from the
+  graphics kernel (`D3DKMTQueryAdapterInfo`, the same data behind fan/temp tooling) and
+  utilisation from the `GPU Engine` performance counters, reporting the busiest engine the
+  way Task Manager does. The status bar then reads *"ok (GPU via Windows)"*.
 - `hwmon\HardwareMonitor.cs` — tiny C# helper compiled against
   [LibreHardwareMonitor](https://github.com/LibreHardwareMonitor/LibreHardwareMonitor);
   prints CPU/GPU sensor JSON once a second. Compiled with the `csc.exe` that ships with

@@ -499,6 +499,213 @@ class PingWorker(threading.Thread):
             pass
         return False, None
 
+# --------------------------------------------------- windows gpu sensors ---
+
+class _GUID(ctypes.Structure):
+    _fields_ = [("Data1", ctypes.c_ulong), ("Data2", ctypes.c_ushort),
+                ("Data3", ctypes.c_ushort), ("Data4", ctypes.c_ubyte * 8)]
+
+
+class _LUID(ctypes.Structure):
+    _fields_ = [("LowPart", wintypes.DWORD), ("HighPart", ctypes.c_long)]
+
+
+class _DXGI_ADAPTER_DESC1(ctypes.Structure):
+    _fields_ = [("Description", ctypes.c_wchar * 128),
+                ("VendorId", wintypes.UINT), ("DeviceId", wintypes.UINT),
+                ("SubSysId", wintypes.UINT), ("Revision", wintypes.UINT),
+                ("DedicatedVideoMemory", ctypes.c_size_t),
+                ("DedicatedSystemMemory", ctypes.c_size_t),
+                ("SharedSystemMemory", ctypes.c_size_t),
+                ("AdapterLuid", _LUID), ("Flags", wintypes.UINT)]
+
+
+class _D3DKMT_ADAPTERINFO(ctypes.Structure):
+    _fields_ = [("hAdapter", wintypes.UINT), ("AdapterLuid", _LUID),
+                ("NumOfSources", wintypes.ULONG),
+                ("bPrecisePresentRegionsPreferred", wintypes.BOOL)]
+
+
+class _D3DKMT_ENUMADAPTERS2(ctypes.Structure):
+    _fields_ = [("NumAdapters", wintypes.ULONG),
+                ("pAdapters", ctypes.POINTER(_D3DKMT_ADAPTERINFO))]
+
+
+class _D3DKMT_QUERYADAPTERINFO(ctypes.Structure):
+    _fields_ = [("hAdapter", wintypes.UINT), ("Type", ctypes.c_int),
+                ("pPrivateDriverData", ctypes.c_void_p),
+                ("PrivateDriverDataSize", wintypes.UINT)]
+
+
+class _PDH_FMT_COUNTERVALUE(ctypes.Structure):
+    _fields_ = [("CStatus", wintypes.DWORD), ("doubleValue", ctypes.c_double)]
+
+
+class _PDH_ITEM_W(ctypes.Structure):
+    _fields_ = [("szName", wintypes.LPWSTR), ("FmtValue", _PDH_FMT_COUNTERVALUE)]
+
+
+class WinGpu:
+    """GPU temperature and utilisation read straight from Windows.
+
+    LibreHardwareMonitor talks to vendor SDKs, which go blind whenever a card
+    is newer than the bundled library or the vendor driver is mid-update - on
+    an RX 9070 XT it reports no GPU sensors at all. These two Windows
+    interfaces are vendor-neutral and keep working regardless:
+
+      temperature - D3DKMTQueryAdapterInfo(ADAPTER_PERFDATA) from the graphics
+                    kernel, which also carries fan RPM
+      utilisation - the "GPU Engine" performance counters, summed over the
+                    3D engines belonging to this adapter
+
+    Everything is best-effort: any failure leaves the values as None and the
+    LibreHardwareMonitor readings stand.
+    """
+
+    PERFDATA_TYPE = 62   # KMTQAITYPE_ADAPTERPERFDATA
+    PERFDATA_SIZE = 64
+    TEMP_OFFSET = 56     # ADAPTER_PERFDATA.Temperature, in 0.1 C
+    FAN_OFFSET = 48
+    PDH_FMT_DOUBLE = 0x00000200
+
+    def __init__(self):
+        self.name = None
+        self._luid = None       # (high, low) of the chosen adapter
+        self._hadapter = None
+        self._pdh = None
+        self._query = None
+        self._counter = None
+        try:
+            self._pick_adapter()
+            self._open_counters()
+        except Exception:       # ctypes/COM boundary - never break the app
+            pass
+
+    # -- setup --
+    def _pick_adapter(self):
+        """Choose the discrete GPU: the adapter with the most dedicated VRAM."""
+        dxgi = ctypes.WinDLL("dxgi")
+        iid = _GUID(0x770aae78, 0xf26f, 0x4dba,
+                    (ctypes.c_ubyte * 8)(0xa8, 0x29, 0x25, 0x3c,
+                                         0x83, 0xd1, 0xb3, 0x87))
+        fac = ctypes.c_void_p()
+        if dxgi.CreateDXGIFactory1(ctypes.byref(iid), ctypes.byref(fac)) != 0:
+            return
+        fvt = ctypes.cast(fac, ctypes.POINTER(ctypes.POINTER(ctypes.c_void_p)))[0]
+        enum1 = ctypes.WINFUNCTYPE(ctypes.c_long, ctypes.c_void_p, wintypes.UINT,
+                                   ctypes.POINTER(ctypes.c_void_p))(fvt[12])
+        best = None
+        i = 0
+        while True:
+            ad = ctypes.c_void_p()
+            if enum1(fac, i, ctypes.byref(ad)) != 0:
+                break
+            avt = ctypes.cast(ad, ctypes.POINTER(ctypes.POINTER(ctypes.c_void_p)))[0]
+            desc1 = ctypes.WINFUNCTYPE(ctypes.c_long, ctypes.c_void_p,
+                                       ctypes.POINTER(_DXGI_ADAPTER_DESC1))(avt[10])
+            d = _DXGI_ADAPTER_DESC1()
+            if desc1(ad, ctypes.byref(d)) == 0 and d.DedicatedVideoMemory:
+                if best is None or d.DedicatedVideoMemory > best[1]:
+                    best = (d.Description, d.DedicatedVideoMemory,
+                            d.AdapterLuid.HighPart, d.AdapterLuid.LowPart)
+            i += 1
+        if best:
+            self.name = best[0]
+            self._luid = (best[2], best[3])
+            self._hadapter = self._find_kmt_handle(*self._luid)
+
+    @staticmethod
+    def _find_kmt_handle(hi, lo):
+        """Graphics-kernel handle for the adapter with this LUID."""
+        gdi32 = ctypes.windll.gdi32
+        e = _D3DKMT_ENUMADAPTERS2()
+        e.NumAdapters = 0
+        e.pAdapters = None
+        if gdi32.D3DKMTEnumAdapters2(ctypes.byref(e)) != 0 or not e.NumAdapters:
+            return None
+        arr = (_D3DKMT_ADAPTERINFO * e.NumAdapters)()
+        e.pAdapters = ctypes.cast(arr, ctypes.POINTER(_D3DKMT_ADAPTERINFO))
+        if gdi32.D3DKMTEnumAdapters2(ctypes.byref(e)) != 0:
+            return None
+        for i in range(e.NumAdapters):
+            if (arr[i].AdapterLuid.HighPart == hi
+                    and arr[i].AdapterLuid.LowPart == lo):
+                return arr[i].hAdapter
+        return None
+
+    def _open_counters(self):
+        pdh = ctypes.WinDLL("pdh")
+        q = wintypes.HANDLE()
+        if pdh.PdhOpenQueryW(None, 0, ctypes.byref(q)) != 0:
+            return
+        c = wintypes.HANDLE()
+        if pdh.PdhAddEnglishCounterW(
+                q, r"\GPU Engine(*)\Utilization Percentage",
+                0, ctypes.byref(c)) != 0:
+            return
+        pdh.PdhCollectQueryData(q)   # first sample primes the counter
+        self._pdh, self._query, self._counter = pdh, q, c
+
+    # -- reads --
+    def temperature(self):
+        if self._hadapter is None:
+            return None
+        try:
+            buf = (ctypes.c_ubyte * self.PERFDATA_SIZE)()
+            q = _D3DKMT_QUERYADAPTERINFO()
+            q.hAdapter = self._hadapter
+            q.Type = self.PERFDATA_TYPE
+            q.pPrivateDriverData = ctypes.cast(buf, ctypes.c_void_p)
+            q.PrivateDriverDataSize = self.PERFDATA_SIZE
+            if ctypes.windll.gdi32.D3DKMTQueryAdapterInfo(ctypes.byref(q)) & 0xFFFFFFFF:
+                return None
+            deci_c = int.from_bytes(
+                bytes(buf[self.TEMP_OFFSET:self.TEMP_OFFSET + 4]), "little")
+            temp = deci_c / 10.0
+            return temp if 0.0 < temp < 150.0 else None
+        except Exception:
+            return None
+
+    def load(self):
+        if not self._query:
+            return None
+        try:
+            self._pdh.PdhCollectQueryData(self._query)
+            size = wintypes.DWORD(0)
+            count = wintypes.DWORD(0)
+            self._pdh.PdhGetFormattedCounterArrayW(
+                self._counter, self.PDH_FMT_DOUBLE,
+                ctypes.byref(size), ctypes.byref(count), None)
+            if not size.value:
+                return None
+            buf = (ctypes.c_ubyte * size.value)()
+            if self._pdh.PdhGetFormattedCounterArrayW(
+                    self._counter, self.PDH_FMT_DOUBLE, ctypes.byref(size),
+                    ctypes.byref(count), buf) != 0:
+                return None
+            items = ctypes.cast(buf, ctypes.POINTER(_PDH_ITEM_W))
+            tag = ("luid_0x%08x_0x%08x" % self._luid).lower()
+            # Sum each engine type across processes, then report the busiest -
+            # what Task Manager shows. Summing every engine instead would
+            # double-count (copy/video run alongside 3D), and taking 3D alone
+            # would read zero for compute workloads.
+            per_engine = {}
+            for i in range(count.value):
+                nm = (items[i].szName or "").lower()
+                if tag not in nm:
+                    continue
+                m = re.search(r"engtype_(\w+)", nm)
+                if not m:
+                    continue
+                per_engine[m.group(1)] = (per_engine.get(m.group(1), 0.0)
+                                          + items[i].FmtValue.doubleValue)
+            if not per_engine:
+                return None
+            return max(0.0, min(100.0, max(per_engine.values())))
+        except Exception:
+            return None
+
+
 # ------------------------------------------------------- hardware worker ---
 
 class HardwareWorker(threading.Thread):
@@ -512,6 +719,7 @@ class HardwareWorker(threading.Thread):
     def __init__(self):
         super().__init__(daemon=True)
         self.proc = None
+        self.wingpu = WinGpu()
 
     def run(self):
         exe = resource_path(os.path.join("bin", "HardwareMonitor.exe"))
@@ -556,11 +764,26 @@ class HardwareWorker(threading.Thread):
         if cpu_load is None and psutil:
             cpu_load = psutil.cpu_percent(interval=None)
         gpu = self._pick_gpu(data.get("gpus") or [])
+        gpu_temp = gpu.get("temp") if gpu else None
+        gpu_load = gpu.get("load") if gpu else None
+
+        # No temperature means the vendor SDK could not read this card (too
+        # new for the bundled sensor library, or the driver is mid-update).
+        # Windows can still tell us, so use it for both figures rather than
+        # trusting a load reading from a source that is clearly blind.
+        if gpu_temp is None:
+            win_temp = self.wingpu.temperature()
+            win_load = self.wingpu.load()
+            if win_temp is not None or win_load is not None:
+                gpu_temp = win_temp
+                gpu_load = win_load
+                STATS.hw_status = "ok (GPU via Windows)"
+
         STATS.set(
             cpu=cpu_load,
             cpu_temp=data.get("cpu_temp"),
-            gpu=gpu.get("load") if gpu else None,
-            gpu_temp=gpu.get("temp") if gpu else None,
+            gpu=gpu_load,
+            gpu_temp=gpu_temp,
         )
 
     @classmethod
@@ -572,12 +795,14 @@ class HardwareWorker(threading.Thread):
         return max(candidates, key=lambda g: g.get("load") or -1.0)
 
     def _psutil_only(self, seconds):
+        """Helper unavailable: CPU load from psutil, GPU from Windows itself."""
         for _ in range(seconds):
             if not RUNNING.is_set():
                 return
-            if psutil:
-                STATS.set(cpu=psutil.cpu_percent(interval=None),
-                          cpu_temp=None, gpu=None, gpu_temp=None)
+            STATS.set(cpu=psutil.cpu_percent(interval=None) if psutil else None,
+                      cpu_temp=None,
+                      gpu=self.wingpu.load(),
+                      gpu_temp=self.wingpu.temperature())
             time.sleep(1)
 
     def stop(self):
