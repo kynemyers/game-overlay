@@ -116,6 +116,14 @@ This creates a venv, installs PyInstaller, and produces `dist\GameOverlay.exe`.
 
 - `overlay.py` — tkinter overlay (frameless, transparent, click-through via
   `WS_EX_TRANSPARENT`) plus the settings window and worker threads.
+- **If CPU temperature shows `--`**, Windows is refusing to load the kernel driver the
+  sensor library needs (its vulnerable-driver blocklist covers that driver). The chip is
+  supported — every core is listed, but every reading comes back empty. Two ways round it:
+  install **[Core Temp](https://www.alcpu.com/CoreTemp/)** (free, portable zip available)
+  and leave it running — it has its own signed driver, and the overlay reads its
+  temperature automatically, showing *"CPU via Core Temp"* in the status bar. Or turn off
+  the blocklist under Windows Security → Device security → Core isolation, which is a real
+  security trade-off worth weighing. Everything else works either way.
 - GPU usage and temperature have a **vendor-neutral fallback**. LibreHardwareMonitor goes
   blind when a card is newer than the bundled sensor library or the vendor driver is
   mid-update (an RX 9070 XT reports no GPU sensors at all in that state). When no GPU

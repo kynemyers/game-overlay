@@ -13,9 +13,11 @@ import ctypes
 import ipaddress
 import json
 import math
+import mmap
 import os
 import re
 import socket
+import struct
 import subprocess
 import sys
 import threading
@@ -706,6 +708,68 @@ class WinGpu:
             return None
 
 
+# ---------------------------------------------------- core temp fallback ---
+
+class CoreTempShm:
+    """CPU temperature from Core Temp's shared memory, when it is running.
+
+    Some machines refuse to load the kernel driver LibreHardwareMonitor uses
+    for CPU temperature - Windows' vulnerable-driver blocklist covers it - so
+    every core reads back empty even though the chip is fully supported. Core
+    Temp (free, alcpu.com) ships its own signed driver and publishes readings
+    through a documented shared memory block, so if the user runs it we can
+    show a real CPU temperature instead of nothing.
+
+    Entirely optional: no Core Temp simply means no value, no error.
+    """
+
+    TAGS = ("CoreTempMappingObjectEx", "CoreTempMappingObject")
+    # CORE_TEMP_SHARED_DATA: uiLoad[256], uiTjMax[128], uiCoreCnt, uiCPUCnt,
+    # fTemp[256], fVID, fCPUSpeed, fFSBSpeed, fMultiplier, sCPUName[100],
+    # ucFahrenheit, ucDeltaToTjMax
+    FMT = "<256I128I2I256f4f100sBB"
+    SIZE = struct.calcsize(FMT)
+
+    def __init__(self):
+        self.cpu_name = None
+
+    def cpu_temperature(self):
+        """Hottest core right now, in Celsius, or None."""
+        for tag in self.TAGS:
+            try:
+                m = mmap.mmap(-1, self.SIZE, tagname=tag, access=mmap.ACCESS_READ)
+            except OSError:
+                continue
+            try:
+                raw = m.read(self.SIZE)
+            finally:
+                m.close()
+            if len(raw) < self.SIZE or not any(raw):
+                continue        # mapping exists but Core Temp is not publishing
+            try:
+                vals = struct.unpack(self.FMT, raw)
+            except struct.error:
+                continue
+            tjmax = vals[256:384]
+            core_cnt, cpu_cnt = vals[384], vals[385]
+            temps = vals[386:642]
+            self.cpu_name = vals[646].split(b"\x00")[0].decode("latin-1", "ignore")
+            fahrenheit, delta_to_tjmax = vals[647], vals[648]
+            n = max(1, core_cnt) * max(1, cpu_cnt)
+            readings = []
+            for i in range(min(n, len(temps))):
+                t = temps[i]
+                if delta_to_tjmax:      # value is degrees below TjMax
+                    t = tjmax[i if i < len(tjmax) else 0] - t
+                if fahrenheit:
+                    t = (t - 32.0) * 5.0 / 9.0
+                if 0.0 < t < 150.0:
+                    readings.append(t)
+            if readings:
+                return max(readings)    # hottest core, as most tools report
+        return None
+
+
 # ------------------------------------------------------- hardware worker ---
 
 class HardwareWorker(threading.Thread):
@@ -720,6 +784,7 @@ class HardwareWorker(threading.Thread):
         super().__init__(daemon=True)
         self.proc = None
         self.wingpu = WinGpu()
+        self.coretemp = CoreTempShm()
 
     def run(self):
         exe = resource_path(os.path.join("bin", "HardwareMonitor.exe"))
@@ -763,6 +828,16 @@ class HardwareWorker(threading.Thread):
         cpu_load = data.get("cpu_load")
         if cpu_load is None and psutil:
             cpu_load = psutil.cpu_percent(interval=None)
+
+        # A machine that blocks the sensor driver reports every core as empty.
+        # Core Temp, if the user runs it, has its own driver and publishes
+        # readings we can use instead of showing nothing.
+        cpu_temp = data.get("cpu_temp")
+        if cpu_temp is None:
+            cpu_temp = self.coretemp.cpu_temperature()
+            if cpu_temp is not None and "Core Temp" not in STATS.hw_status:
+                STATS.hw_status = "%s (CPU via Core Temp)" % STATS.hw_status.split(" (")[0]
+
         gpu = self._pick_gpu(data.get("gpus") or [])
         gpu_temp = gpu.get("temp") if gpu else None
         gpu_load = gpu.get("load") if gpu else None
@@ -781,7 +856,7 @@ class HardwareWorker(threading.Thread):
 
         STATS.set(
             cpu=cpu_load,
-            cpu_temp=data.get("cpu_temp"),
+            cpu_temp=cpu_temp,
             gpu=gpu_load,
             gpu_temp=gpu_temp,
         )
