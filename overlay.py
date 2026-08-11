@@ -828,6 +828,12 @@ IGNORED_PROCS = {
     "epicgameslauncher.exe", "battle.net.exe", "claude.exe", "spotify.exe",
     "slack.exe", "whatsapp.exe", "whatsapp.root.exe", "telegram.exe",
     "signal.exe", "teams.exe", "ms-teams.exe", "messenger.exe",
+    # consoles/terminals: running the overlay from a prompt otherwise makes
+    # that prompt "the game", so FPS attaches to it and ping hunts for match
+    # traffic on a shell that will never have any
+    "cmd.exe", "conhost.exe", "powershell.exe", "pwsh.exe",
+    "windowsterminal.exe", "openconsole.exe", "python.exe", "pythonw.exe",
+    "py.exe", "code.exe", "notepad.exe", "wt.exe",
 }
 
 
