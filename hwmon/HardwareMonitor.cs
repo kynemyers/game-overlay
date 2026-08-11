@@ -45,8 +45,66 @@ class HardwareMonitor
         return 0;
     }
 
-    static void Main()
+    // Lists every piece of hardware and every sensor found, so a machine that
+    // reports no CPU temperature can say why (usually the ring0 driver failed
+    // to load: sensors of type Load appear, Temperature ones do not).
+    static void Dump()
     {
+        Computer c = new Computer();
+        c.IsCpuEnabled = true;
+        c.IsGpuEnabled = true;
+        c.IsMotherboardEnabled = true;
+        try
+        {
+            c.Open();
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine("Computer.Open() FAILED: " + ex.GetType().Name + ": " + ex.Message);
+            Console.WriteLine("(this usually means the kernel driver could not load - see");
+            Console.WriteLine(" Windows Security > Device security > Core isolation)");
+            return;
+        }
+        foreach (IHardware hw in c.Hardware)
+        {
+            try { hw.Update(); } catch (Exception ex)
+            {
+                Console.WriteLine("[" + hw.HardwareType + "] " + hw.Name +
+                                  "  UPDATE FAILED: " + ex.Message);
+                continue;
+            }
+            Console.WriteLine("[" + hw.HardwareType + "] " + hw.Name);
+            int n = 0;
+            foreach (ISensor s in hw.Sensors)
+            {
+                Console.WriteLine("    " + s.SensorType + " / " + s.Name + " = " +
+                                  (s.Value.HasValue ? s.Value.Value.ToString("F1") : "null"));
+                n++;
+            }
+            if (n == 0) Console.WriteLine("    (no sensors exposed)");
+            foreach (IHardware sub in hw.SubHardware)
+            {
+                try { sub.Update(); } catch (Exception) { }
+                Console.WriteLine("    -- " + sub.Name);
+                foreach (ISensor s in sub.Sensors)
+                    Console.WriteLine("        " + s.SensorType + " / " + s.Name + " = " +
+                                      (s.Value.HasValue ? s.Value.Value.ToString("F1") : "null"));
+            }
+        }
+        try { c.Close(); } catch (Exception) { }
+    }
+
+    static void Main(string[] args)
+    {
+        foreach (string a in args)
+        {
+            if (a == "--dump")
+            {
+                Dump();
+                return;
+            }
+        }
+
         // Exit when the parent process closes our stdin.
         Thread watchdog = new Thread(delegate()
         {
