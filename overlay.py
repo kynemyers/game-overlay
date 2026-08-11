@@ -1334,12 +1334,38 @@ def stop_workers(workers):
 
 
 def selftest():
+    """Print a full diagnostic. Run with --selftest and send the output when
+    something is not reading on a machine you cannot poke at directly."""
     if sys.stdout is None:  # windowed exe has no console - log to a file
         os.makedirs(CONFIG_DIR, exist_ok=True)
         sys.stdout = open(os.path.join(CONFIG_DIR, "selftest.txt"), "w", encoding="utf-8")
+
+    try:
+        admin = bool(shell32.IsUserAnAdmin())
+    except OSError:
+        admin = False
+    print("=== environment ===")
+    print("admin rights   :", "YES" if admin else "NO  <-- CPU temp, FPS and ping need this")
+    print("python         :", sys.version.split()[0], "(frozen exe)" if
+          getattr(sys, "frozen", False) else "(from source)")
+    for rel in ("bin/HardwareMonitor.exe", "bin/PresentMon.exe"):
+        p = resource_path(rel.replace("/", os.sep))
+        print("%-15s: %s" % (rel.split("/")[-1], "found" if os.path.exists(p) else "MISSING"))
+    try:
+        cpu_name = ""
+        if psutil:
+            import platform
+            cpu_name = platform.processor()
+        print("cpu            :", cpu_name or "unknown")
+    except Exception:
+        pass
+    wg = WinGpu()
+    print("gpu (windows)  :", wg.name or "not detected",
+          "temp=%s load=%s" % (wg.temperature(), wg.load()))
+
     cfg = load_config()
     workers = start_workers(cfg)
-    print("collecting for 8 seconds...")
+    print("\ncollecting for 8 seconds...")
     time.sleep(8)
     stats = STATS.get()
     print("stats:", json.dumps({k: (round(v, 1) if isinstance(v, float) else v)
@@ -1348,6 +1374,8 @@ def selftest():
     print("hw_status:  ", STATS.hw_status)
     print("fps_status: ", STATS.fps_status)
     stop_workers(workers)
+    print("\n(if a value is null: CPU temp needs admin; ping/loss only read"
+          " during an actual match)")
 
 
 def main():
